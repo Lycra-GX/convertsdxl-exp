@@ -234,7 +234,7 @@ from diffusers import (
 import os
 
 # ---------------------------------------------------------------------------
-# Intel Extension for PyTorch (IPEX) — optional, graceful fallback
+# Intel Extension for PyTorch (IPEX) & Native CPU acceleration
 # ---------------------------------------------------------------------------
 try:
     import intel_extension_for_pytorch as ipex
@@ -242,7 +242,18 @@ try:
     print("[IPEX] Intel Extension for PyTorch detected — CPU acceleration enabled.")
 except ImportError:
     IPEX_AVAILABLE = False
-    print("[IPEX] intel_extension_for_pytorch not found — falling back to standard PyTorch.")
+    print("[IPEX] intel_extension_for_pytorch not found — falling back to native PyTorch CPU optimizations.")
+
+# PyTorch 2.5+ ships oneDNN (MKL-DNN) with native Intel AMX support built-in.
+# Enabling it here means bfloat16 autocast will automatically dispatch GEMMs
+# to AMX hardware on 4th Gen+ Intel Xeon CPUs — no external package needed.
+torch.backends.mkldnn.enabled = True
+
+# Use all available CPU threads for maximum parallelism during data generation.
+_cpu_count = os.cpu_count() or 1
+torch.set_num_threads(_cpu_count)
+torch.set_num_interop_threads(max(1, _cpu_count // 2))
+print(f"[CPU] oneDNN/AMX enabled. Using {_cpu_count} intra-op threads.")
 
 data = {"clip": [], "clip2": [], "unet": [], "vae": []}
 
@@ -285,8 +296,6 @@ scheduler = pipe.scheduler
 # ---------------------------------------------------------------------------
 # IPEX optimization — applied once after model extraction, CPU-only.
 # ipex.optimize() fuses operators and enables AMX-backed kernels for bfloat16.
-# The VAE is intentionally left out: its decode step is upcast to fp32 by the
-# existing logic below, which is necessary for numerical stability in SDXL.
 # ---------------------------------------------------------------------------
 if IPEX_AVAILABLE and device == "cpu":
     print("[IPEX] Optimizing text_encoder, text_encoder_2, and unet …")
@@ -295,13 +304,16 @@ if IPEX_AVAILABLE and device == "cpu":
     unet = ipex.optimize(unet.eval(), dtype=torch.bfloat16, inplace=True)
     print("[IPEX] Optimization complete.")
 
-# When IPEX + AMP is active we run inference under bfloat16 autocast.
-# On CUDA the existing fp16 path is used, so we pick the right context manager.
-if IPEX_AVAILABLE and device == "cpu":
+# ---------------------------------------------------------------------------
+# AMP autocast context — wraps all CPU inference in bfloat16.
+# On CPU this triggers oneDNN AMX kernels for GEMMs (matmul / attention).
+# On CUDA the existing fp16 path is used instead.
+# ---------------------------------------------------------------------------
+if device == "cpu":
     amp_autocast = lambda: torch.cpu.amp.autocast(dtype=torch.bfloat16)  # noqa: E731
 else:
     import contextlib
-    amp_autocast = contextlib.nullcontext  # no-op on CUDA or when IPEX absent
+    amp_autocast = contextlib.nullcontext  # no-op on CUDA
 
 idx = 0
 

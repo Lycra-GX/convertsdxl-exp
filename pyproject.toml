@@ -7,7 +7,7 @@ requires-python = ">=3.10"
 
 dependencies = [
     "torch==2.5.1+cpu",
-    "intel-extension-for-pytorch==2.5.10+cpu",
+    "intel-extension-for-pytorch==2.5.0",
     "accelerate",
     "diffusers==0.31.0",
     "transformers==4.46.1",
@@ -26,16 +26,8 @@ torch = [
 torchvision = [
     { index = "pytorch-cpu" },
 ]
-intel-extension-for-pytorch = [
-    { index = "ipex-cpu" },
-]
 
 [[tool.uv.index]]
 name = "pytorch-cpu"
 url = "https://download.pytorch.org/whl/cpu"
-explicit = true
-
-[[tool.uv.index]]
-name = "ipex-cpu"
-url = "https://pytorch-extension.intel.com/release-whl/stable/cpu/us/"
 explicit = true
