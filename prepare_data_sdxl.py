@@ -233,13 +233,28 @@ from diffusers import (
 )
 import os
 
+# ---------------------------------------------------------------------------
+# Intel Extension for PyTorch (IPEX) — optional, graceful fallback
+# ---------------------------------------------------------------------------
+try:
+    import intel_extension_for_pytorch as ipex
+    IPEX_AVAILABLE = True
+    print("[IPEX] Intel Extension for PyTorch detected — CPU acceleration enabled.")
+except ImportError:
+    IPEX_AVAILABLE = False
+    print("[IPEX] intel_extension_for_pytorch not found — falling back to standard PyTorch.")
+
 data = {"clip": [], "clip2": [], "unet": [], "vae": []}
+
+# On CPU we always load in fp32 so IPEX / AMX bfloat16 autocast can take over.
+# On CUDA we keep the existing fp16 path and skip IPEX.
+device = "cuda" if torch.cuda.is_available() else "cpu"
+load_dtype = torch.float16 if device == "cuda" else torch.float32
 
 pipe = StableDiffusionXLPipeline.from_single_file(
     safetensor_path,
-    torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+    torch_dtype=load_dtype,
 )
-device = "cuda" if torch.cuda.is_available() else "cpu"
 pipe = pipe.to(device)
 
 if scheduler_name == "dpm":
@@ -267,6 +282,27 @@ tokenizer = pipe.tokenizer
 tokenizer_2 = pipe.tokenizer_2
 scheduler = pipe.scheduler
 
+# ---------------------------------------------------------------------------
+# IPEX optimization — applied once after model extraction, CPU-only.
+# ipex.optimize() fuses operators and enables AMX-backed kernels for bfloat16.
+# The VAE is intentionally left out: its decode step is upcast to fp32 by the
+# existing logic below, which is necessary for numerical stability in SDXL.
+# ---------------------------------------------------------------------------
+if IPEX_AVAILABLE and device == "cpu":
+    print("[IPEX] Optimizing text_encoder, text_encoder_2, and unet …")
+    text_encoder = ipex.optimize(text_encoder.eval(), dtype=torch.bfloat16, inplace=True)
+    text_encoder_2 = ipex.optimize(text_encoder_2.eval(), dtype=torch.bfloat16, inplace=True)
+    unet = ipex.optimize(unet.eval(), dtype=torch.bfloat16, inplace=True)
+    print("[IPEX] Optimization complete.")
+
+# When IPEX + AMP is active we run inference under bfloat16 autocast.
+# On CUDA the existing fp16 path is used, so we pick the right context manager.
+if IPEX_AVAILABLE and device == "cpu":
+    amp_autocast = lambda: torch.cpu.amp.autocast(dtype=torch.bfloat16)  # noqa: E731
+else:
+    import contextlib
+    amp_autocast = contextlib.nullcontext  # no-op on CUDA or when IPEX absent
+
 idx = 0
 
 
@@ -292,10 +328,10 @@ def generate(prompt, negative_prompt, cfg, steps):
 
     data["clip"].append([text_input_ids.cpu().numpy()])
 
-    with torch.no_grad():
+    with torch.no_grad(), amp_autocast():
         prompt_embeds_1 = text_encoder(text_input_ids, output_hidden_states=True)
         # SDXL uses the penultimate hidden state from CLIP 1
-        prompt_embeds_1_hidden = prompt_embeds_1.hidden_states[-2]
+        prompt_embeds_1_hidden = prompt_embeds_1.hidden_states[-2].float()
 
     # ========== CLIP 2 (text_encoder_2, OpenCLIP) ==========
     text_inputs_2 = tokenizer_2(
@@ -309,12 +345,12 @@ def generate(prompt, negative_prompt, cfg, steps):
 
     data["clip2"].append([text_input_ids_2.cpu().numpy()])
 
-    with torch.no_grad():
+    with torch.no_grad(), amp_autocast():
         prompt_embeds_2 = text_encoder_2(text_input_ids_2, output_hidden_states=True)
         # SDXL uses the penultimate hidden state from CLIP 2
-        prompt_embeds_2_hidden = prompt_embeds_2.hidden_states[-2]
+        prompt_embeds_2_hidden = prompt_embeds_2.hidden_states[-2].float()
         # Pooled output from CLIP 2 is used as text_embeds for added_cond_kwargs
-        pooled_prompt_embeds = prompt_embeds_2[0]
+        pooled_prompt_embeds = prompt_embeds_2[0].float()
 
     # Concatenate the hidden states from both CLIP encoders
     prompt_embeds = torch.cat([prompt_embeds_1_hidden, prompt_embeds_2_hidden], dim=-1)
@@ -370,7 +406,7 @@ def generate(prompt, negative_prompt, cfg, steps):
                 add_time_ids.cpu().numpy(),
             ]
         )
-        with torch.no_grad():
+        with torch.no_grad(), amp_autocast():
             noise_pred = unet(
                 latent_model_input,
                 t,
@@ -380,6 +416,8 @@ def generate(prompt, negative_prompt, cfg, steps):
                     "time_ids": add_time_ids,
                 },
             ).sample
+        # Cast back to fp32 so scheduler arithmetic stays numerically stable.
+        noise_pred = noise_pred.float()
 
         if do_classifier_free_guidance:
             noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
